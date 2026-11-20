@@ -1,4 +1,4 @@
-# Pres Planner: a pre-drinks shopping list for a night out, and the shops to
+# pre-tty perfect: a pre-drinks shopping list for a night out, and the shops to
 # buy it from. CLAUDE.md is the contract this file follows.
 
 manifest_version: 1
@@ -13,7 +13,7 @@ app_author_name: "royya6"
 app:
   # Fixed by the repository name: Pippa-Labs/pippa-hack-app-1c04.
   id: hack.app_1c04
-  name: Pres Planner
+  name: "pre-tty perfect"
   # Bump this before pushing again once a version has been submitted for
   # review (0.1.0 -> 0.1.1); a draft can be pushed again under the same one.
   version: 0.1.0

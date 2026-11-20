@@ -1,4 +1,4 @@
-"""Pres Planner: a pre-drinks shopping list for a night out.
+"""pre-tty perfect: a pre-drinks shopping list for a night out.
 
 Given a group size, a budget, a leaving time and where they are setting off
 from, it works out what to buy (drinks, water, snacks, and food if they have
@@ -40,7 +40,7 @@ from pippa_agentapp_sdk import (
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
 
 #: Nominatim refuses a request without a descriptive User-Agent (docs/API_APPS.md).
-USER_AGENT = "pippa-agent-app-pres-planner/0.1 (https://github.com/Pippa-Labs)"
+USER_AGENT = "pippa-agent-app-pre-tty-perfect/0.1 (https://github.com/Pippa-Labs)"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search?"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter?"
 SHOP_RADIUS_M = 1000
@@ -488,7 +488,7 @@ class App:
     @staticmethod
     def _sentence(data: dict) -> str:
         people = data["group_size"]
-        text = (f"Pres Planner list for {people} "
+        text = (f"pre-tty perfect list for {people} "
                 f"{'person' if people == 1 else 'people'}: about "
                 f"£{data['estimated_total']:.2f} "
                 f"(£{data['per_person_cost']:.2f} each)")

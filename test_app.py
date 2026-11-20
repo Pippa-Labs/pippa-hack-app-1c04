@@ -1,4 +1,4 @@
-"""Tests for Pres Planner, run by the build through LocalRunner.
+"""Tests for pre-tty perfect, run by the build through LocalRunner.
 
 The network is stubbed: `_fetch` is replaced on the instance with canned
 Nominatim and Overpass replies, so nothing here reaches the internet.
