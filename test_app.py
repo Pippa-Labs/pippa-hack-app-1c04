@@ -1,156 +1,213 @@
-"""Tests for your app. Run them with `pytest`.
+"""Tests for Pres Planner, run by the build through LocalRunner.
 
-Keep these. Publishing runs them, and a repository whose tests fail does not
-deploy — which is the fastest feedback you will get all day, because the
-alternative is finding out from a user that your app answers wrongly.
-
-`LocalRunner` is the same code the production runtime uses to call your app.
-So a call that works here works deployed, and — more usefully — a `Result`
-that violates your manifest fails here exactly as it would in production.
-That is the whole reason to test through the runner rather than calling
-`App().handle(...)` directly.
+The network is stubbed: `_fetch` is replaced on the instance with canned
+Nominatim and Overpass replies, so nothing here reaches the internet.
 """
 
 from __future__ import annotations
 
+import json
+import urllib.error
 from datetime import datetime, timezone
 
 import pytest
-from pippa_agentapp_sdk import LocalRunner, OutputShapeViolation
+from pippa_agentapp_sdk import LocalRunner
 
-from app import App, CannotReadDate
+from app import App, BudgetTooSmall
 
-# A fixed "now", so a test that passes today still passes next March.
-# 21:00 UTC on purpose: it is already the next day in New Zealand, which is
-# what makes the time zone test below mean anything. At 09:00 UTC it is still
-# the same day everywhere that matters, and the test would pass whether or not
-# the code handled time zones at all.
-NOW = datetime(2026, 10, 22, 21, 0, tzinfo=timezone.utc)
+# 19:00 in London (GMT in November), so "9pm" is two hours away.
+NOW = datetime(2026, 11, 20, 19, 0, tzinfo=timezone.utc)
+
+GEOCODE = json.dumps([{"lat": "53.4450", "lon": "-2.2190"}]).encode()
+SHOPS = json.dumps({"elements": [
+    {"type": "node", "lat": 53.4480, "lon": -2.2190,
+     "tags": {"shop": "supermarket", "name": "Far Supermarket"}},
+    {"type": "node", "lat": 53.4452, "lon": -2.2190,
+     "tags": {"shop": "alcohol", "name": "Corner Offie",
+              "opening_hours": "Mo-Su 10:00-23:00"}},
+    {"type": "way", "center": {"lat": 53.4460, "lon": -2.2190},
+     "tags": {"shop": "convenience", "brand": "Co-op"}},
+    {"type": "node", "tags": {"shop": "alcohol"}},   # no position: skipped
+]}).encode()
+
+STRONG_WORDS = ("wine", "Prosecco", "Vodka")
 
 
-def call(inputs: dict, outcome: str = "days.until", *, explicit: bool = False):
-    """Run one outcome the way the runtime does, and return the Result.
+def fake_fetch(geocode=GEOCODE, shops=SHOPS):
+    def fetch(url, timeout=6.0):
+        if "nominatim" in url:
+            return geocode
+        if "overpass" in url:
+            return shops
+        raise AssertionError(f"unexpected url {url}")
+    return fetch
 
-    `granted_secrets` is required even though a hackathon app never has any —
-    the runner takes it on every call, so an empty dict is how you say "none".
 
-    `explicit=True` calls the app the way Pippa does when the person picked
-    it by name (`@Days Until ...`) instead of Pippa choosing it. The app sees
-    it as `call.context.explicit`.
-    """
-    return LocalRunner(App()).call(
-        outcome, inputs, granted_secrets={}, now=NOW, request_id="test-1",
+def run(inputs, *, explicit=False, fetch=None):
+    app = App()
+    app._fetch = fetch or fake_fetch()
+    return LocalRunner(app).call(
+        "pres.plan", inputs, granted_secrets={}, now=NOW, request_id="t1",
         explicit=explicit,
     ).result
 
 
 def test_the_manifest_is_valid():
-    """The first thing to break, and the easiest to miss.
-
-    `App()` validates manifest.yaml as it is constructed, so this fails the
-    moment the manifest is malformed — before anything else has a chance to
-    produce a more confusing error.
-    """
     app = App()
-    assert app.manifest.app_id.startswith("hack.")
-    assert [o.id for o in app.manifest.outcomes] == ["days.until"]
+    assert app.manifest.app_id == "hack.app_1c04"
+    assert [o.id for o in app.manifest.outcomes] == ["pres.plan"]
 
 
-def test_it_counts_the_days():
-    result = call({"date": "2026-12-25"})
-    assert result.data["days"] == 64
-    assert result.data["target_date"] == "2026-12-25"
-    assert result.data["weekday"] == "Friday"
-    assert result.data["already_passed"] is False
+def test_a_group_plan_fits_the_budget_and_lists_shops():
+    data = run({"group_size": 4, "budget": 40, "priority": "cheap",
+                "leaving_time": "9pm", "start_place": "Fallowfield"}).data
+    assert data["estimated_total"] <= 40
+    assert data["budget"] == 40
+    assert data["group_size"] == 4
+    assert data["hours_until_leaving"] == 2.0
+    assert 0 < data["alcohol_units_per_person"] <= 4.5
+    assert any("Water" in line for line in data["shopping_list"])
+    assert data["per_person_cost"] == round(data["estimated_total"] / 4, 2)
+    # Closest first; the shop with no position is skipped.
+    assert data["shops"][0].startswith("Corner Offie (off-licence), 20 m away")
+    assert "Mo-Su 10:00-23:00" in data["shops"][0]
+    assert data["shops"][1].startswith("Co-op (convenience store)")
+    assert len(data["shops"]) == 3
+    assert data["shops_searched_near"] == "Fallowfield"
 
 
-def test_a_date_written_in_words_works():
-    result = call({"date": "25 December"})
-    assert result.data["target_date"] == "2026-12-25"
+def test_the_total_is_the_sum_of_the_lines():
+    data = run({"group_size": 5, "budget": 60}).data
+    pence = sum(round(float(line.rsplit("£", 1)[1]) * 100)
+                for line in data["shopping_list"])
+    assert pence == round(data["estimated_total"] * 100)
 
 
-def test_a_date_already_gone_rolls_to_next_year():
-    """`1 January` asked in October means the January that is coming."""
-    result = call({"date": "1 January"})
-    assert result.data["target_date"] == "2027-01-01"
-    assert result.data["already_passed"] is False
+def test_a_tight_budget_is_never_exceeded():
+    for budget in (5, 8, 12, 20):
+        data = run({"group_size": 4, "budget": budget}).data
+        assert data["estimated_total"] <= budget
 
 
-def test_the_users_timezone_decides_what_today_is():
-    """21:00 UTC is already tomorrow in Auckland.
-
-    Worth a test of its own: it is the bug every date app has, it only shows
-    up for users in some parts of the world, and it is invisible if you only
-    ever test from one place.
-    """
-    here = call({"date": "2026-10-23"}).data["days"]
-    there = call({"date": "2026-10-23", "timezone": "Pacific/Auckland"}).data["days"]
-    assert here == 1    # still the 22nd in UTC
-    assert there == 0   # already the 23rd in Auckland
+def test_over_the_weekly_guideline_the_list_is_alcohol_free():
+    data = run({"group_size": 2, "units_last_7_days": 18}).data
+    assert data["alcohol_units_per_person"] == 0
+    assert any("14" in line for line in data["advice"])
+    assert not any(word in line for line in data["shopping_list"]
+                   for word in ("Lager, 4", "Cider", "Vodka", "IPA"))
 
 
-def test_a_made_up_timezone_never_reaches_the_app():
-    """The platform checks declared types before your code runs.
-
-    `type: timezone` in the manifest means the runtime validates it. So your
-    app does not need to — and should not, because a hand-rolled check here
-    would be dead code that looks load-bearing.
-    """
-    from pippa_agentapp_sdk import InputShapeViolation
-
-    with pytest.raises(InputShapeViolation):
-        call({"date": "2026-12-25", "timezone": "Mars/Olympus"})
+def test_close_to_the_guideline_skips_strong_drinks():
+    data = run({"group_size": 2, "units_last_7_days": 11}).data
+    assert 0 < data["alcohol_units_per_person"] <= 2.0
+    assert not any(word in line for line in data["shopping_list"]
+                   for word in STRONG_WORDS)
 
 
-def test_no_date_is_an_error_a_user_can_read():
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""})
-    # `user_message` is the only part a user may be shown, so it is the part
-    # worth asserting on. The rest stays in the logs.
-    assert failure.value.user_message == "I could not work out which date you meant."
+def test_low_tolerance_means_fewer_and_weaker_drinks():
+    data = run({"group_size": 3, "tolerance": "low", "leaving_time": "11pm"}).data
+    assert data["alcohol_units_per_person"] <= 2.5
+    assert not any(word in line for line in data["shopping_list"]
+                   for word in STRONG_WORDS)
 
 
-def test_nonsense_is_refused_rather_than_guessed():
-    with pytest.raises(CannotReadDate):
-        call({"date": "a week on Thursday-ish"})
+def test_disliked_drinks_are_left_out():
+    data = run({"group_size": 4, "dislikes": "wine, cider",
+                "priority": "tasty"}).data
+    lines = " ".join(data["shopping_list"]).lower()
+    assert "wine" not in lines and "prosecco" not in lines and "cider" not in lines
 
 
-def test_picked_by_name_it_answers_and_refuses_as_usual():
-    """`@Days Until ...` in the chat: the person picked this app themselves.
-
-    Then nothing checks whether the message suits the app. It is called
-    whatever the words, and `call.context.explicit` is True. The right
-    response is the ordinary one: answer what you can, and refuse only for a
-    missing or unreadable input, with a sentence that says what was wrong.
-    Never refuse because the message does not look like your example phrases
-    — the person has already told you it is for you.
-
-    This app never reads the flag, because it never needed to: it already
-    refuses only for a missing or unreadable date. If yours does, read it as
-    `getattr(call.context, "explicit", False)`. An app published before the
-    platform update that added the flag runs on an SDK that does not have
-    it, until you publish it again.
-    """
-    picked = call({"date": "2026-12-25"}, explicit=True)
-    assert picked.data == call({"date": "2026-12-25"}).data
-
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""}, explicit=True)
-    assert failure.value.user_message == "I could not work out which date you meant."
+def test_not_having_eaten_adds_food():
+    hungry = run({"group_size": 4, "has_eaten": False}).data
+    fed = run({"group_size": 4, "has_eaten": True}).data
+    assert any("pizza" in line for line in hungry["shopping_list"])
+    assert not any("pizza" in line for line in fed["shopping_list"])
 
 
-def test_the_runner_enforces_the_manifest(monkeypatch):
-    """Proof that the contract is real, and the reason to test through it.
+def test_spirits_come_with_a_mixer():
+    everything_else = "beer cider wine seltzer gin"
+    lines = " ".join(run({"group_size": 8, "dislikes": everything_else})
+                     .data["shopping_list"])
+    assert "Vodka" in lines and "mixer" in lines
 
-    An app returning a field it did not declare is refused. You will meet this
-    error if you add something to `data` and forget to add it to `output` in
-    manifest.yaml — which is the single most common way a first app fails
-    after it deploys.
-    """
-    from pippa_agentapp_sdk import Result
 
-    monkeypatch.setattr(
-        App, "handle", lambda self, c: Result(data={"surprise": "hello"})
-    )
-    with pytest.raises(OutputShapeViolation):
-        call({"date": "2026-12-25"})
+def test_a_small_group_gets_no_big_bottles():
+    """A 35cl bottle or a bottle of prosecco for two drinks is mostly waste."""
+    for priority in ("cheap", "tasty", ""):
+        lines = " ".join(run({"group_size": 1, "priority": priority}).data["shopping_list"])
+        assert "Vodka" not in lines and "Prosecco" not in lines
+
+
+def test_drinks_come_before_snacks_on_a_tight_budget():
+    data = run({"group_size": 4, "budget": 5}).data
+    assert any("soft drink" in line for line in data["shopping_list"])
+
+
+def test_missing_details_are_assumed_and_said():
+    data = run({}).data
+    assert data["group_size"] == 1
+    assert "hours_until_leaving" not in data
+    assert "shops" not in data
+    advice = " ".join(data["advice"])
+    assert "one person" in advice and "leaving time" in advice
+    assert "setting off" in advice
+
+
+def test_an_unreadable_leaving_time_is_said():
+    data = run({"leaving_time": "after the match"}).data
+    assert "hours_until_leaving" not in data
+    assert any("could not read the leaving time" in a for a in data["advice"])
+
+
+def test_leaving_time_formats():
+    assert App._parse_clock("9pm") == (21, 0)
+    assert App._parse_clock("21:30") == (21, 30)
+    assert App._parse_clock("9.30") == (21, 30)
+    assert App._parse_clock("12am") == (0, 0)
+    assert App._parse_clock("midnight") == (0, 0)
+    assert App._parse_clock("25:00") is None
+
+
+def test_leaving_after_midnight_counts_forward():
+    data = run({"leaving_time": "1am"}).data
+    assert data["hours_until_leaving"] == 6.0
+
+
+def test_a_place_not_on_the_map_still_gives_a_list():
+    data = run({"start_place": "Narnia"}, fetch=fake_fetch(geocode=b"[]")).data
+    assert data["shops"] == []
+    assert any("could not find Narnia" in a for a in data["advice"])
+    assert data["shopping_list"]
+
+
+def test_a_shop_lookup_timeout_still_gives_a_list():
+    def slow(url, timeout=6.0):
+        raise TimeoutError("timed out")
+    data = run({"start_place": "Leeds", "group_size": 2}, fetch=slow).data
+    assert data["shops"] == []
+    assert any("could not look up shops" in a for a in data["advice"])
+
+
+def test_a_busy_shop_lookup_still_gives_a_list():
+    def busy(url, timeout=6.0):
+        raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+    data = run({"start_place": "Leeds"}, fetch=busy).data
+    assert data["shops"] == []
+    assert any("busy" in a for a in data["advice"])
+
+
+def test_the_destination_is_used_when_there_is_no_start():
+    data = run({"destination": "Deansgate"}).data
+    assert data["shops_searched_near"] == "Deansgate"
+
+
+def test_a_tiny_budget_is_refused_plainly():
+    with pytest.raises(BudgetTooSmall) as failure:
+        run({"budget": 1})
+    assert "£1.00" in failure.value.user_message
+
+
+def test_picked_by_name_it_answers_the_same():
+    inputs = {"group_size": 3, "budget": 30}
+    assert run(inputs, explicit=True).data == run(inputs).data
